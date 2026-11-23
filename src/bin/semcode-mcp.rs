@@ -12,6 +12,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[path = "semcode_mcp_http.rs"]
+mod mcp_http;
+
 /// Truncate output at 3,000 lines with a warning message
 /// "Under: <guard>" as its own line for a definition inside a conditional,
 /// nothing at file scope.
@@ -2282,6 +2285,12 @@ async fn mcp_show_callchain_with_limits(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Transport {
+    Stdio,
+    Http,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "semcode-mcp")]
 #[command(about = "Semcode MCP Server - Provides semantic code search via Model Context Protocol", long_about = None)]
@@ -2301,6 +2310,54 @@ struct Args {
     /// Enable lazy tool loading (reduces initial context by ~96%)
     #[arg(long, default_value = "false")]
     lazy: bool,
+
+    /// Transport to serve. Defaults to stdio for backward compatibility.
+    #[arg(long, value_enum, default_value_t = Transport::Stdio)]
+    transport: Transport,
+
+    /// HTTP listen address (IPv4/IPv6 literal). Only used with --transport http.
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
+
+    /// HTTP port; 0 asks the OS for one and prints the actual address.
+    #[arg(long, default_value_t = 8765)]
+    port: u16,
+
+    /// Serve HTTP without sessions (JSON responses, no GET SSE). Optional mode.
+    #[arg(long)]
+    stateless_http: bool,
+
+    /// Additional allowed Host authorities, repeatable (e.g. semcode.example.com:8765).
+    #[arg(long = "allowed-host")]
+    allowed_hosts: Vec<String>,
+
+    /// Allowed Origin values, repeatable (exact match, e.g. http://localhost:8765).
+    #[arg(long = "allowed-origin")]
+    allowed_origins: Vec<String>,
+
+    /// Maximum POST body size in bytes.
+    #[arg(long, default_value_t = 1_048_576)]
+    max_request_bytes: usize,
+
+    /// Maximum buffered HTTP response size in bytes (SSE responses are not buffered).
+    #[arg(long, default_value_t = 16_777_216)]
+    max_response_bytes: usize,
+
+    /// Maximum concurrent POST requests; overflow receives HTTP 429.
+    #[arg(long, default_value_t = 16)]
+    max_in_flight: usize,
+
+    /// SSE keep-alive interval in seconds.
+    #[arg(long, default_value_t = 15)]
+    sse_keep_alive_secs: u64,
+
+    /// Do not start the background indexing task for the current commit.
+    #[arg(long)]
+    no_auto_index: bool,
+
+    /// Read the optional HTTP Bearer token from this file (must be 0400).
+    #[arg(long)]
+    token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -3118,6 +3175,53 @@ fn get_tool_schema(name: &str) -> Option<Value> {
     }
 }
 
+/// Meta-tools exposed in lazy mode (~96% context reduction).
+fn lazy_tool_schemas() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "list_categories",
+            "description": "List available tool categories. Call this first to discover what semcode can do.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "get_tools",
+            "description": "Get the full schema for tools in a category. Use this to get tool details before calling them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "Category name from list_categories (e.g., 'code_lookup', 'code_search', 'git_history', 'lore_email', 'status')"
+                    }
+                },
+                "required": ["category"]
+            }
+        }),
+        json!({
+            "name": "call_tool",
+            "description": "Execute a semcode tool by name with given arguments. Use get_tools first to see the required arguments.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Name of the tool to call (e.g., 'find_function', 'grep_functions')"
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "Arguments to pass to the tool (see get_tools for schema)"
+                    }
+                },
+                "required": ["tool_name"]
+            }
+        }),
+    ]
+}
+
 /// Get all tool schemas as a vector
 fn get_all_tool_schemas() -> Vec<Value> {
     let tool_names = [
@@ -3355,16 +3459,6 @@ impl McpServer {
     }
 
     async fn handle_initialize(&self, _params: &Value) -> Value {
-        let instructions = if self.lazy_mode {
-            "# semcode\n\n\
-             semcode provides git-aware code exploration, code search, git history archaeology, \
-             and lore.kernel.org mailing list search.\n\n\
-             Server is running in lazy mode. Use `list_categories` to discover tool categories, \
-             `get_tools` to inspect schemas for a category, and `call_tool` to execute them."
-        } else {
-            include_str!("../../docs/semcode-mcp.md")
-        };
-
         json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
@@ -3374,63 +3468,40 @@ impl McpServer {
                 "name": "semcode-mcp",
                 "version": "0.1.0"
             },
-            "instructions": instructions
+            "instructions": self.instructions()
         })
     }
 
-    async fn handle_list_tools(&self) -> Value {
+    /// Instructions advertised by `initialize`.
+    ///
+    /// Shared with the HTTP transport so the two transports cannot drift.
+    fn instructions(&self) -> String {
         if self.lazy_mode {
-            // Return only meta-tools for lazy loading (~96% context reduction)
-            json!({
-                "tools": [
-                    {
-                        "name": "list_categories",
-                        "description": "List available tool categories. Call this first to discover what semcode can do.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {},
-                            "additionalProperties": false
-                        }
-                    },
-                    {
-                        "name": "get_tools",
-                        "description": "Get the full schema for tools in a category. Use this to get tool details before calling them.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "category": {
-                                    "type": "string",
-                                    "description": "Category name from list_categories (e.g., 'code_lookup', 'code_search', 'git_history', 'lore_email', 'status')"
-                                }
-                            },
-                            "required": ["category"]
-                        }
-                    },
-                    {
-                        "name": "call_tool",
-                        "description": "Execute a semcode tool by name with given arguments. Use get_tools first to see the required arguments.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "tool_name": {
-                                    "type": "string",
-                                    "description": "Name of the tool to call (e.g., 'find_function', 'grep_functions')"
-                                },
-                                "arguments": {
-                                    "type": "object",
-                                    "description": "Arguments to pass to the tool (see get_tools for schema)"
-                                }
-                            },
-                            "required": ["tool_name"]
-                        }
-                    }
-                ]
-            })
+            "# semcode\n\n\
+             semcode provides git-aware code exploration, code search, git history archaeology, \
+             and lore.kernel.org mailing list search.\n\n\
+             Server is running in lazy mode. Use `list_categories` to discover tool categories, \
+             `get_tools` to inspect schemas for a category, and `call_tool` to execute them."
+                .to_string()
         } else {
-            // Return all tools (existing behavior)
-            json!({
-                "tools": get_all_tool_schemas()
-            })
+            include_str!("../../docs/semcode-mcp.md").to_string()
+        }
+    }
+
+    async fn handle_list_tools(&self) -> Value {
+        json!({
+            "tools": self.exposed_tool_schemas()
+        })
+    }
+
+    /// Tool definitions `tools/list` actually exposes (lazy vs full).
+    ///
+    /// The HTTP adapter parses these into `rmcp::model::Tool` once at startup.
+    fn exposed_tool_schemas(&self) -> Vec<Value> {
+        if self.lazy_mode {
+            lazy_tool_schemas()
+        } else {
+            get_all_tool_schemas()
         }
     }
 
@@ -6334,6 +6405,11 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    let transport_name = match args.transport {
+        Transport::Stdio => "stdio",
+        Transport::Http => "http",
+    };
+
     eprintln!("Starting Semcode MCP Server...");
     eprintln!(
         "Database: {}",
@@ -6344,7 +6420,57 @@ async fn main() -> Result<()> {
         "Lazy loading: {}",
         if args.lazy { "enabled" } else { "disabled" }
     );
-    eprintln!("Transport: stdio");
+    eprintln!("Transport: {transport_name}");
+
+    // Validate the transport configuration before touching the database, so a
+    // misconfiguration fails immediately instead of after a long startup.
+    let http_config = match args.transport {
+        Transport::Http => {
+            let bind: std::net::IpAddr = args
+                .bind
+                .parse()
+                .map_err(|_| anyhow::anyhow!("--bind must be an IP address literal"))?;
+            if args.max_in_flight == 0 || args.max_in_flight > 1024 {
+                return Err(anyhow::anyhow!("--max-in-flight must be 1..=1024"));
+            }
+            if args.max_request_bytes == 0 || args.max_response_bytes == 0 {
+                return Err(anyhow::anyhow!(
+                    "--max-request-bytes and --max-response-bytes must be greater than zero"
+                ));
+            }
+            Some(mcp_http::HttpConfig {
+                bind,
+                port: args.port,
+                stateless: args.stateless_http,
+                allowed_hosts: args.allowed_hosts.clone(),
+                allowed_origins: args.allowed_origins.clone(),
+                max_request_bytes: args.max_request_bytes,
+                max_response_bytes: args.max_response_bytes,
+                max_in_flight: args.max_in_flight,
+                // Zero disables keep-alive pings entirely.
+                sse_keep_alive: (args.sse_keep_alive_secs > 0)
+                    .then(|| tokio::time::Duration::from_secs(args.sse_keep_alive_secs)),
+                token: mcp_http::resolve_token(args.token_file.as_deref())?,
+            })
+        }
+        Transport::Stdio => {
+            // HTTP-only settings must not be silently ignored under stdio:
+            // an operator who typed `--bind 0.0.0.0` and saw the server start
+            // would believe it applied.
+            if args.bind != "127.0.0.1"
+                || args.port != 8765
+                || args.stateless_http
+                || !args.allowed_hosts.is_empty()
+                || !args.allowed_origins.is_empty()
+                || args.token_file.is_some()
+            {
+                return Err(anyhow::anyhow!(
+                    "HTTP options require --transport http (got --transport stdio)"
+                ));
+            }
+            None
+        }
+    };
 
     // Process database path with search order: 1) -d flag, 2) current directory
     let database_path = process_database_path(args.database.as_deref(), None);
@@ -6354,35 +6480,50 @@ async fn main() -> Result<()> {
         Arc::new(McpServer::new(&database_path, &args.git_repo, args.model_path, args.lazy).await?);
 
     // Spawn background task to index current commit if needed
-    eprintln!("[Background] Spawning background indexing task");
-    let db_for_indexing = server.db.clone();
-    let git_repo_for_indexing = args.git_repo.clone();
-    let indexing_state_for_bg = server.indexing_state.clone();
-    let notification_tx_for_bg = server.notification_tx.clone();
-    let indexing_handle = tokio::spawn(async move {
-        // Ensure tables exist before indexing
-        if let Err(e) = db_for_indexing.create_tables().await {
-            eprintln!("[Background] Error creating/verifying tables: {}", e);
-        }
+    let indexing_handle = if args.no_auto_index {
+        eprintln!("[Background] Automatic indexing disabled (--no-auto-index)");
+        None
+    } else {
+        eprintln!("[Background] Spawning background indexing task");
+        let db_for_indexing = server.db.clone();
+        let git_repo_for_indexing = args.git_repo.clone();
+        let indexing_state_for_bg = server.indexing_state.clone();
+        let notification_tx_for_bg = server.notification_tx.clone();
+        Some(tokio::spawn(async move {
+            // Ensure tables exist before indexing
+            if let Err(e) = db_for_indexing.create_tables().await {
+                eprintln!("[Background] Error creating/verifying tables: {}", e);
+            }
 
-        index_current_commit_background(
-            db_for_indexing,
-            git_repo_for_indexing,
-            indexing_state_for_bg,
-            notification_tx_for_bg,
-        )
-        .await;
-    });
+            index_current_commit_background(
+                db_for_indexing,
+                git_repo_for_indexing,
+                indexing_state_for_bg,
+                notification_tx_for_bg,
+            )
+            .await;
+        }))
+    };
 
     // Give the background task a chance to start before entering the blocking loop
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-    // Run MCP server on stdio
-    run_stdio_server(server).await?;
+    match args.transport {
+        Transport::Stdio => {
+            // Run MCP server on stdio
+            run_stdio_server(server).await?;
+        }
+        Transport::Http => {
+            let cfg = http_config.expect("HTTP transport has a configuration");
+            mcp_http::serve(server, cfg).await?;
+        }
+    }
 
     // Gracefully shutdown the background indexing task
-    indexing_handle.abort();
-    let _ = indexing_handle.await;
+    if let Some(indexing_handle) = indexing_handle {
+        indexing_handle.abort();
+        let _ = indexing_handle.await;
+    }
 
     Ok(())
 }

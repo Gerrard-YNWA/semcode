@@ -7,6 +7,10 @@ description = "Semantic code search for C/C++ codebases"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/facebookexperimental/semcode"
+# Every binary is declared below. Disabling auto-discovery keeps
+# `src/bin/semcode_mcp_http.rs` a module of `semcode-mcp` (pulled in with
+# `#[path]`) instead of becoming a binary target of its own.
+autobins = false
 
 [dependencies]
 lancedb = "0.27"
@@ -48,6 +52,12 @@ dashmap = "6.1"
 tempfile = "3.27"
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
+# MCP Streamable HTTP transport. Pinned exactly: rmcp tracks a fast-moving
+# specification, and bumping it must be a reviewed change.
+rmcp = { version = "=3.10.0", default-features = false, features = [
+    "server",
+    "transport-streamable-http-server",
+] }
 tokio-tungstenite = "0.29"
 anstream = "1.0"        # Auto TTY/NO_COLOR handling; print!/println! and Write adapters [web:17]
 owo-colors = { version = "4", features = ["supports-colors"] }  # .red().bold(), optional detection helpers [web:27]
@@ -86,6 +96,10 @@ path = "src/bin/semcode-mcp.rs"
 [[bin]]
 name = "semcode-lsp"
 path = "src/bin/semcode-lsp.rs"
+
+[[bin]]
+name = "test-vectors"
+path = "src/bin/test-vectors.rs"
 
 [profile.release]
 debug = false

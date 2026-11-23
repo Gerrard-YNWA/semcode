@@ -1,0 +1,10 @@
+git
+.git
+.worktrees
+target
+bin
+test_code
+test_output
+*.db
+.semcode.db
+*.log

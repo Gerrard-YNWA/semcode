@@ -1,0 +1,57 @@
+# HTTP-transport build for semcode-mcp.
+#
+# `rmcp` requires Rust 1.88 (edition 2024). Building and running in containers
+# lets a CentOS 7 host stay on its old userland: the runtime image supplies its
+# own glibc. Building on a modern host and copying the binary onto CentOS 7
+# will not work (glibc mismatch).
+#
+#   docker build -t semcode-mcp:local -f Dockerfile.http .
+#   ./scripts/run-mcp-http.sh --repo /srv/src/linux
+
+FROM rust:1.98-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        clang \
+        libclang-dev \
+        protobuf-compiler \
+        libprotobuf-dev \
+        libssl-dev \
+        pkg-config \
+        nasm \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+
+# Cargo registry and target directories are BuildKit caches. Only the final
+# binary is copied to a normal layer, so rebuilds after a source change reuse
+# the compiled dependencies.
+ENV CARGO_TARGET_DIR=/build/target
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked -j 4 --bin semcode-mcp --bin semcode-index \
+    && cp /build/target/release/semcode-mcp /build/target/release/semcode-index /usr/local/bin/
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+        libcurl4 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --system --uid 10001 --create-home --home-dir /home/semcode semcode \
+    && mkdir -p /home/semcode/.cache/semcode/models /data \
+    && chown -R semcode:semcode /home/semcode /data
+
+COPY --from=builder /usr/local/bin/semcode-mcp /usr/local/bin/semcode-mcp
+COPY --from=builder /usr/local/bin/semcode-index /usr/local/bin/semcode-index
+
+USER semcode
+ENV HOME=/home/semcode
+EXPOSE 8765
+
+# The index, the Git repository, and the model cache are mounted at runtime;
+# none of them belongs in the image. See scripts/run-mcp-http.sh.
+ENTRYPOINT ["/usr/local/bin/semcode-mcp"]

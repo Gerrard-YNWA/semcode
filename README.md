@@ -273,6 +273,90 @@ mcp-config.json:
 
 See examples/mcp-config.json for an example file
 
+### HTTP transport (Streamable HTTP)
+
+`semcode-mcp` can also serve MCP over the Streamable HTTP transport. One
+process serves one index and one repository, so run one server per repository.
+
+```bash
+# Optional. When set, every request must carry this Bearer token.
+export SEMCODE_MCP_TOKEN="at-least-32-visible-ascii-characters"
+
+semcode-mcp --transport http \
+  --bind 127.0.0.1 --port 8765 \
+  --database /path/to/repo/.semcode.db \
+  --git-repo /path/to/repo
+```
+
+The endpoint is `http://127.0.0.1:8765/mcp`; it accepts the POST/GET/DELETE
+methods of the Streamable HTTP transport on that one path. There is no legacy
+`/sse` endpoint.
+
+- **Authentication is optional.** With `SEMCODE_MCP_TOKEN` (or `--token-file`)
+  every request must send `Authorization: Bearer <token>`. Without it the
+  endpoint is unauthenticated and logs a startup warning; `Host`/`Origin`
+  validation still applies, but it is not authentication. Prefer loopback, an
+  SSH tunnel, or a TLS-terminating reverse proxy for anything beyond a
+  single-user machine.
+- **Sessions are stateful by default.** An `initialize` response carries
+  `Mcp-Session-Id`; GET opens the SSE stream and DELETE ends the session.
+  `--stateless-http` is available for probes and sessionless proxies.
+- **Other useful flags:** `--lazy`, `--no-auto-index`, `--allowed-host`,
+  `--allowed-origin`, `--max-in-flight`, `--max-request-bytes`,
+  `--max-response-bytes`, `--sse-keep-alive-secs` (0 disables pings).
+- **Browser-based clients** send an `Origin` header and are refused unless that
+  exact origin is listed with `--allowed-origin`. Non-browser MCP clients do
+  not send one, so they need no extra configuration.
+
+Client configuration (omit the `headers` block when no token is configured):
+
+```json
+{"mcpServers":{"semcode":{"type":"http","url":"http://127.0.0.1:8765/mcp","headers":{"Authorization":"Bearer <token>"}}}}
+```
+
+The Claude Code CLI equivalent:
+
+```bash
+claude mcp add --transport http semcode http://127.0.0.1:8765/mcp \
+  --header "Authorization: Bearer $SEMCODE_MCP_TOKEN"
+```
+
+#### Container deployment (CentOS 7 hosts)
+
+The HTTP transport pulls in `rmcp`, which requires Rust 1.88 (edition 2024).
+CentOS 7 hosts do not need a newer toolchain: build and run the server in a
+container, which supplies its own userland. Do not build on a modern image and
+copy the binary onto the host — that glibc mismatch will not run.
+
+```bash
+docker build -t semcode-mcp:local -f Dockerfile.http .
+docker run --rm -p 127.0.0.1:8765:8765 \
+  -v /srv/semcode/index/.semcode.db:/data/.semcode.db \
+  -v /srv/src/linux:/repo:ro \
+  -v semcode-models:/home/semcode/.cache/semcode/models \
+  semcode-mcp:local \
+  --transport http --bind 0.0.0.0 --port 8765 \
+  --database /data/.semcode.db --git-repo /repo --no-auto-index
+```
+
+`scripts/run-mcp-http.sh` wraps that command, checks the paths, and keeps the
+token off the command line:
+
+```bash
+SEMCODE_MCP_TOKEN=... ./scripts/run-mcp-http.sh --repo /srv/src/linux
+SEMCODE_MCP_TOKEN=... ./scripts/run-mcp-http.sh --repo /srv/src/linux \
+  --db /srv/semcode/index/.semcode.db --port 9000 --detach --no-auto-index
+```
+
+Bind `0.0.0.0` inside the container and publish only to host loopback; clients
+still send `Host: 127.0.0.1:8765`, which the default allowlist accepts. Never
+put the container's `0.0.0.0` in `--allowed-host`.
+
+The image needs the index to exist before it starts: run
+`semcode-index -s /srv/src/linux` on the host first, or drop
+`--no-auto-index` and mount the index directory writeable so the server can
+index the current commit at startup.
+
 #### Verify MCP Tools Are Available
 
 Ask Claude to list available tools:

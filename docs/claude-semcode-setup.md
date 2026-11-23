@@ -75,6 +75,40 @@ EOF
 claude --mcp-config mcp-config.json
 ```
 
+### Configuring an HTTP MCP server
+
+A long-lived server can serve the same tools over Streamable HTTP, so several
+agents share one index without each spawning a process:
+
+```bash
+# On the machine that holds the index. The token is optional; when it is set,
+# every request must carry it.
+export SEMCODE_MCP_TOKEN="at-least-32-visible-ascii-characters"
+semcode-mcp --transport http --bind 127.0.0.1 --port 8765 \
+  --database /path/to/repo/.semcode.db --git-repo /path/to/repo
+```
+
+Register the endpoint once:
+
+```bash
+claude mcp add --transport http semcode http://127.0.0.1:8765/mcp \
+  --header "Authorization: Bearer $SEMCODE_MCP_TOKEN"
+```
+
+The equivalent config file, with the `headers` block omitted when no token is
+configured:
+
+```
+cat > mcp-http-config.json << EOF
+{"mcpServers":{"semcode":{"type":"http","url":"http://127.0.0.1:8765/mcp","headers":{"Authorization":"Bearer $SEMCODE_MCP_TOKEN"}}}}
+EOF
+claude --mcp-config mcp-http-config.json
+```
+
+From another machine, tunnel the port rather than exposing it:
+`ssh -N -L 8765:127.0.0.1:8765 user@server`. One server serves one repository;
+run one per repository on distinct ports.
+
 ## Trying it out
 
 Now you can make sure Claude is able to use semcode:
